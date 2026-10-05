@@ -242,9 +242,10 @@ const OUTPUT_DEFS = [
     ]},
   { key: 'polarSpeed',        label: 'Polar speed & ratio',
     paths: [
-      { sk: 'performance/polarSpeed',      label: 'Polar target speed', mk: 'bsp', fb: SPEED_DEFAULT },
-      { sk: 'performance/targetSpeed',     label: 'Target boat speed',  mk: 'bsp', fb: SPEED_DEFAULT },
-      { sk: 'performance/polarSpeedRatio', label: 'Speed ratio',        mk: 'performance', fb: RATIO_DEFAULT },
+      { sk: 'performance/polarSpeed',         label: 'Steady-state polar speed', mk: 'bsp', fb: SPEED_DEFAULT },
+      { sk: 'performance/dynamicTargetSpeed', label: 'Dynamic target speed',     mk: 'bsp', fb: SPEED_DEFAULT },
+      { sk: 'performance/targetSpeed',        label: 'Target boat speed',        mk: 'bsp', fb: SPEED_DEFAULT },
+      { sk: 'performance/polarSpeedRatio',    label: 'Speed ratio',              mk: 'performance', fb: RATIO_DEFAULT },
     ]},
   { key: 'maxSpeed',         label: 'Max polar speed',
     paths: [
@@ -389,11 +390,12 @@ function _buildOverviewPage() {
 
   right.appendChild(sectionHeading('Live Performance'))
   right.appendChild(buildTable([
-    { label: 'True Wind Speed',  id: 'ov-tws'  },
-    { label: 'True Wind Angle',  id: 'ov-twa'  },
-    { label: 'Boat Speed',       id: 'ov-bsp'  },
-    { label: 'Polar Target',     id: 'ov-pol'  },
-    { label: 'Performance',      id: 'ov-perf' },
+    { label: 'True Wind Speed',        id: 'ov-tws'  },
+    { label: 'True Wind Angle',        id: 'ov-twa'  },
+    { label: 'Boat Speed',             id: 'ov-bsp'  },
+    { label: 'Steady Polar Target',    id: 'ov-pol'  },
+    { label: 'Dynamic Target (Active)',id: 'ov-dyn'  },
+    { label: 'Performance',            id: 'ov-perf' },
   ]))
 
   // Targets and warnings — appended lazily by _tickOverview
@@ -488,6 +490,7 @@ function _tickOverview() {
   setVal('ov-twa',  fmtVal(d?.twa  != null  ? Math.abs(d.twa)  : null, 'twa', ANGLE_DEFAULT))
   setVal('ov-bsp',  fmtVal(d?.bsp,         'bsp',         SPEED_DEFAULT))
   setVal('ov-pol',  fmtVal(d?.polarSpeed,  'polarSpeed',  SPEED_DEFAULT))
+  setVal('ov-dyn',  fmtVal(d?.dynamicTargetSpeed ?? d?.polarSpeed, 'polarSpeed', SPEED_DEFAULT))
   setVal('ov-perf', fmtVal(d?.performance, 'performance', RATIO_DEFAULT))
 
   // Targets — build sub-table on first appearance, then update in-place
@@ -517,15 +520,125 @@ function _tickOverview() {
   updateWarnings(document.getElementById('ov-warnings'), warns)
 }
 
+const SMOOTHER_PARAMS = {
+  Exponential:   { key: 'smootherParamExponential',   label: 'Time constant τ (s)',      min: 0.1,   max: 60,  step: 0.1,   default: 1    },
+  MovingAverage: { key: 'smootherParamMovingAverage', label: 'Window size (s)',           min: 1,     max: 120, step: 1,     default: 10   },
+  Kalman:        { key: 'smootherParamKalman',        label: 'Steady-state gain (0–1)',   min: 0.001, max: 1,   step: 0.001, default: 0.04 },
+}
+
+function _settingsTable(rows) {
+  const tbl = document.createElement('table')
+  tbl.className = 'table table-sm table-borderless mb-0'
+  const tbody = document.createElement('tbody')
+  rows.forEach(r => {
+    const tr = document.createElement('tr')
+    const tdL = document.createElement('td'); tdL.textContent = r.label
+    if (r.desc) {
+      const s = document.createElement('small'); s.className = 'text-muted d-block'; s.textContent = r.desc
+      tdL.appendChild(s)
+    }
+    const tdC = document.createElement('td')
+    if (r.control) tdC.appendChild(r.control)
+    tr.appendChild(tdL); tr.appendChild(tdC)
+    tbody.appendChild(tr)
+  })
+  tbl.appendChild(tbody); return tbl
+}
+
+function _vesselPresets() {
+  const group = document.createElement('div')
+  group.className = 'd-flex gap-2'
+  const presets = [
+    { label: 'Sportsboat (8s)', tau: 8 },
+    { label: 'Club Racer (18s)', tau: 18 },
+    { label: 'Cruiser (32s)', tau: 32 }
+  ]
+  presets.forEach(p => {
+    const btn = document.createElement('button')
+    btn.type = 'button'
+    const isSelected = Math.abs((settings?.vesselResponseTau ?? 18) - p.tau) < 0.5
+    btn.className = isSelected ? 'btn btn-sm btn-primary' : 'btn btn-sm btn-outline-secondary'
+    btn.textContent = p.label
+    btn.addEventListener('click', () => {
+      apiPut('/settings', { vesselResponseTau: p.tau }).then(s => {
+        if (s) { settings = s; switchPage('inputs') }
+      })
+    })
+    group.appendChild(btn)
+  })
+  return group
+}
+
+function _channelSmootherSelector(channel) {
+  const typeKey = channel + 'SmootherType'
+  const sel = document.createElement('select')
+  sel.className = 'form-select form-select-sm'
+  sel.style.width = '100%'
+  ;['None', 'Exponential', 'MovingAverage', 'Kalman'].forEach(opt => {
+    const o = document.createElement('option'); o.value = opt; o.textContent = opt; sel.appendChild(o)
+  })
+  sel.value = settings?.[typeKey] || settings?.smootherType || 'Kalman'
+  sel.addEventListener('change', () => {
+    apiPut('/settings', { [typeKey]: sel.value }).then(s => {
+      if (s) { settings = s; switchPage('inputs') }
+    })
+  })
+  return sel
+}
+
+function _channelSmootherParam(channel) {
+  const type = settings?.[channel + 'SmootherType'] || settings?.smootherType || 'Kalman'
+  const baseParam = SMOOTHER_PARAMS[type]
+  if (!baseParam) return null
+  const paramKey = channel + baseParam.key.charAt(0).toUpperCase() + baseParam.key.slice(1)
+  const val = settings?.[paramKey] ?? settings?.[baseParam.key] ?? baseParam.default
+  return {
+    label: baseParam.label,
+    control: createNumberInput(paramKey, val, { ...baseParam, default: baseParam.default }, true, s => {
+      settings = s
+    })
+  }
+}
+
 // ── PAGE: Inputs ──────────────────────────────────────────────────────────────
 function _buildInputsPage() {
   const wrap = document.createElement('div'); wrap.id = 'inputs-wrap'
 
-  // Smoother settings (top)
-  wrap.appendChild(sectionHeading('Smoother'))
-  const smRows = [{ label: 'Smoother type', control: _smootherSelector() }]
-  const pm = SMOOTHER_PARAMS[settings?.smootherType || 'Exponential']
-  if (pm) smRows.push({ label: pm.label, control: createNumberInput(pm.key, settings?.[pm.key], pm, true) })
+  // Dynamic Boat Response (Gust & Wind Shift Compensation)
+  wrap.appendChild(sectionHeading('Dynamic Boat Response (Gust & Wind Shift Compensation)'))
+  const dynRows = [
+    {
+      label: 'Enable Dynamic Response',
+      desc: 'Compensates for vessel inertia lag during wind gusts, lulls, and wind angle shifts (TWA)',
+      control: createToggle(settings?.dynamicResponseEnabled !== false, v =>
+        apiPut('/settings', { dynamicResponseEnabled: v }).then(s => { if (s) { settings = s; switchPage('inputs') } })
+      )
+    },
+    {
+      label: 'Vessel Presets',
+      desc: 'Quick presets for boat mass and acceleration characteristics',
+      control: _vesselPresets()
+    },
+    {
+      label: 'Hull Response Time τ (s)',
+      desc: 'Vessel time constant for accelerating / decelerating to new polar targets',
+      control: createNumberInput('vesselResponseTau', settings?.vesselResponseTau ?? 18, { min: 1, max: 120, step: 0.5, default: 18 }, true)
+    }
+  ]
+  wrap.appendChild(_settingsTable(dynRows))
+
+  // Decoupled sensor smoothers
+  wrap.appendChild(sectionHeading('Sensor Damping (Decoupled)'))
+  const smRows = [
+    { label: 'Wind Damping Type', desc: 'Vector filter on TWS and TWA', control: _channelSmootherSelector('wind') }
+  ]
+  const windParam = _channelSmootherParam('wind')
+  if (windParam) smRows.push({ label: 'Wind ' + windParam.label, control: windParam.control })
+
+  smRows.push({ label: 'Boat Speed Damping Type', desc: 'Scalar filter on boat speed', control: _channelSmootherSelector('bsp') })
+  const bspParam = _channelSmootherParam('bsp')
+  if (bspParam) smRows.push({ label: 'Boat Speed ' + bspParam.label, control: bspParam.control })
+
   wrap.appendChild(_settingsTable(smRows))
 
   wrap.appendChild(sectionHeading('True Wind Speed'))
@@ -596,47 +709,6 @@ function _tickInputs() {
     if (w && typeof w.message === 'string') warns.push(w.message)
   })
   updateWarnings(document.getElementById('in-warnings'), warns)
-}
-
-// ── PAGE: Settings ─────────────────────────────────────────────────────────────
-const SMOOTHER_PARAMS = {
-  Exponential:   { key: 'smootherParamExponential',   label: 'Time constant τ (s)',      min: 0.1,   max: 60,  step: 0.1,   default: 1    },
-  MovingAverage: { key: 'smootherParamMovingAverage', label: 'Window size (s)',           min: 1,     max: 120, step: 1,     default: 10   },
-  Kalman:        { key: 'smootherParamKalman',        label: 'Steady-state gain (0–1)',   min: 0.001, max: 1,   step: 0.001, default: 0.1  },
-}
-
-function _settingsTable(rows) {
-  const tbl = document.createElement('table')
-  tbl.className = 'table table-sm table-borderless mb-0'
-  const tbody = document.createElement('tbody')
-  rows.forEach(r => {
-    const tr = document.createElement('tr')
-    const tdL = document.createElement('td'); tdL.textContent = r.label
-    if (r.desc) {
-      const s = document.createElement('small'); s.className = 'text-muted d-block'; s.textContent = r.desc
-      tdL.appendChild(s)
-    }
-    const tdC = document.createElement('td')
-    if (r.control) tdC.appendChild(r.control)
-    tr.appendChild(tdL); tr.appendChild(tdC)
-    tbody.appendChild(tr)
-  })
-  tbl.appendChild(tbody); return tbl
-}
-
-function _smootherSelector() {
-  const sel = document.createElement('select')
-  sel.className = 'form-select form-select-sm'; sel.style.width = '100%'
-  ;['None', 'Exponential', 'MovingAverage', 'Kalman'].forEach(opt => {
-    const o = document.createElement('option'); o.value = opt; o.textContent = opt; sel.appendChild(o)
-  })
-  sel.value = settings?.smootherType || 'Exponential'
-  sel.addEventListener('change', () => {
-    apiPut('/settings', { smootherType: sel.value }).then(s => {
-      if (s) { settings = s; switchPage('inputs') }
-    })
-  })
-  return sel
 }
 
 // ── PAGE: Outputs ──────────────────────────────────────────────────────────────

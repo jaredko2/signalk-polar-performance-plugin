@@ -12,17 +12,27 @@ const {
   KalmanSmoother
 } = require('signalkutilities')
 
-const CURRENT_SETTINGS_VERSION = 2
+const CURRENT_SETTINGS_VERSION = 3
 
 const STALE_RESUBSCRIBE_PERIOD = 60000 // ms — idle period before live input subscriptions are re-established
 
 const DEFAULT_SETTINGS = {
   settingsVersion: CURRENT_SETTINGS_VERSION,
   showAllTwsLines: true,
-  smootherType: 'Exponential',
+  smootherType: 'Kalman',
   smootherParamExponential: 1,
   smootherParamMovingAverage: 10,
-  smootherParamKalman: 0.1,
+  smootherParamKalman: 0.05,
+  windSmootherType: 'Kalman',
+  windSmootherParamExponential: 1,
+  windSmootherParamMovingAverage: 10,
+  windSmootherParamKalman: 0.04,
+  bspSmootherType: 'Kalman',
+  bspSmootherParamExponential: 1,
+  bspSmootherParamMovingAverage: 10,
+  bspSmootherParamKalman: 0.04,
+  dynamicResponseEnabled: true,
+  vesselResponseTau: 18.0,
   beatAngle: false,
   beatVMG: false,
   targetTWA: false,
@@ -56,6 +66,8 @@ module.exports = (app) => {
   let windSmoother = null
   let bspSmoother = null
   let hdgSmoother = null
+  let dynamicTargetSpeed = null
+  let lastDynamicUpdateTime = 0
   let metaSentPaths = new Set()  // tracks paths that have had metadata emitted
   let lifecycleWarningMap = new Map()
   let lifecycleWarnings = []
@@ -72,7 +84,7 @@ module.exports = (app) => {
     targetTWA:       ['performance.targetAngle', 'performance.targetVelocityMadeGood'],
     optimumWindAngle:['performance.optimumWindAngle'],
     VMG:             ['performance.velocityMadeGood', 'performance.polarVelocityMadeGood', 'performance.polarVelocityMadeGoodRatio'],
-    polarSpeed:      ['performance.polarSpeed', 'performance.targetSpeed', 'performance.polarSpeedRatio'],
+    polarSpeed:      ['performance.polarSpeed', 'performance.dynamicTargetSpeed', 'performance.targetSpeed', 'performance.polarSpeedRatio'],
     maxSpeed:        ['performance.maxSpeed', 'performance.maxSpeedAngle'],
     tackTrue:        ['performance.tackTrue'],
     smoothedInputs:  ['environment.wind.angleTrueWaterDamped', 'performance.boatSpeedDamped'],
@@ -137,12 +149,27 @@ module.exports = (app) => {
     }
   }
 
-  function getSmootherOptions(type, s) {
+  function getSmootherOptions(type, s, prefix) {
     switch (type) {
       case 'None':          return {}
-      case 'MovingAverage': return { timeSpan: s.smootherParamMovingAverage ?? 10 }
-      case 'Kalman':        return { steadyState: s.smootherParamKalman ?? 0.1 }
-      default:              return { tau: s.smootherParamExponential ?? 1 }
+      case 'MovingAverage':
+        return {
+          timeSpan: (prefix === 'wind' ? s.windSmootherParamMovingAverage : prefix === 'bsp' ? s.bspSmootherParamMovingAverage : null)
+            ?? s.smootherParamMovingAverage
+            ?? 10
+        }
+      case 'Kalman':
+        return {
+          steadyState: (prefix === 'wind' ? s.windSmootherParamKalman : prefix === 'bsp' ? s.bspSmootherParamKalman : null)
+            ?? s.smootherParamKalman
+            ?? 0.05
+        }
+      default:
+        return {
+          tau: (prefix === 'wind' ? s.windSmootherParamExponential : prefix === 'bsp' ? s.bspSmootherParamExponential : null)
+            ?? s.smootherParamExponential
+            ?? 1
+        }
     }
   }
 
@@ -174,6 +201,22 @@ module.exports = (app) => {
       delete s.perfAdjust
       s.settingsVersion = 2
       app.debug('Settings migrated from v1 to v2')
+    }
+
+    if (s.settingsVersion < 3) {
+      // v2 → v3: dynamic vessel acceleration response and decoupled wind/boat speed smoothers
+      if (s.dynamicResponseEnabled === undefined) s.dynamicResponseEnabled = true
+      if (s.vesselResponseTau === undefined) s.vesselResponseTau = 18.0
+      if (!s.windSmootherType) s.windSmootherType = s.smootherType || 'Kalman'
+      if (!s.bspSmootherType) s.bspSmootherType = s.smootherType || 'Kalman'
+      if (s.windSmootherParamKalman === undefined) s.windSmootherParamKalman = s.smootherParamKalman ?? 0.05
+      if (s.bspSmootherParamKalman === undefined) s.bspSmootherParamKalman = s.smootherParamKalman ?? 0.05
+      if (s.windSmootherParamExponential === undefined) s.windSmootherParamExponential = s.smootherParamExponential ?? 1
+      if (s.bspSmootherParamExponential === undefined) s.bspSmootherParamExponential = s.smootherParamExponential ?? 1
+      if (s.windSmootherParamMovingAverage === undefined) s.windSmootherParamMovingAverage = s.smootherParamMovingAverage ?? 10
+      if (s.bspSmootherParamMovingAverage === undefined) s.bspSmootherParamMovingAverage = s.smootherParamMovingAverage ?? 10
+      s.settingsVersion = 3
+      app.debug('Settings migrated from v2 to v3')
     }
 
     // Persist if any migration ran, so migrations don't repeat on next start.
@@ -262,13 +305,23 @@ module.exports = (app) => {
     hasPendingChanges = false
 
     // Smoother type or parameter changes — update all running smoothers in-place
-    const SMOOTHER_KEYS = ['smootherType', 'smootherParamExponential', 'smootherParamMovingAverage', 'smootherParamKalman']
+    const SMOOTHER_KEYS = [
+      'smootherType', 'smootherParamExponential', 'smootherParamMovingAverage', 'smootherParamKalman',
+      'windSmootherType', 'windSmootherParamExponential', 'windSmootherParamMovingAverage', 'windSmootherParamKalman',
+      'bspSmootherType', 'bspSmootherParamExponential', 'bspSmootherParamMovingAverage', 'bspSmootherParamKalman',
+      'dynamicResponseEnabled', 'vesselResponseTau'
+    ]
     if (keys.some(k => SMOOTHER_KEYS.includes(k))) {
-      const SC = getSmootherClass(settings.smootherType)
-      const so = getSmootherOptions(settings.smootherType, settings)
-      if (windSmoother) { windSmoother.setSmootherClass(SC); windSmoother.setSmootherOptions(so) }
-      if (bspSmoother)  { bspSmoother.setSmootherClass(SC);  bspSmoother.setSmootherOptions(so)  }
-      if (hdgSmoother)  { hdgSmoother.setSmootherClass(SC);  hdgSmoother.setSmootherOptions(so)  }
+      const windType = settings.windSmootherType || settings.smootherType || 'Kalman'
+      const bspType = settings.bspSmootherType || settings.smootherType || 'Kalman'
+      const windSC = getSmootherClass(windType)
+      const windSO = getSmootherOptions(windType, settings, 'wind')
+      const bspSC = getSmootherClass(bspType)
+      const bspSO = getSmootherOptions(bspType, settings, 'bsp')
+
+      if (windSmoother) { windSmoother.setSmootherClass(windSC); windSmoother.setSmootherOptions(windSO) }
+      if (bspSmoother)  { bspSmoother.setSmootherClass(bspSC);  bspSmoother.setSmootherOptions(bspSO)  }
+      if (hdgSmoother)  { hdgSmoother.setSmootherClass(windSC); hdgSmoother.setSmootherOptions(windSO) }
     }
 
     // Speed source change — re-point the BSP handler with an explicit unsubscribe/subscribe cycle.
@@ -435,10 +488,34 @@ module.exports = (app) => {
 
     // Polar speed and performance ratios
     const { value: polarSpeed } = polar.speedAt({ tws: TWS, twa: TWA, performanceFactor })
+    const now = Date.now()
+
     if (Number.isFinite(polarSpeed) && polarSpeed > 0) {
+      if (settings.dynamicResponseEnabled !== false) {
+        if (!Number.isFinite(dynamicTargetSpeed) || lastDynamicUpdateTime === 0 || (now - lastDynamicUpdateTime) > 10000) {
+          dynamicTargetSpeed = polarSpeed
+        } else {
+          const dt = Math.max(0.01, (now - lastDynamicUpdateTime) / 1000)
+          const tau = Math.max(1, Number(settings.vesselResponseTau) || 18.0)
+          const alpha = 1 - Math.exp(-dt / tau)
+          dynamicTargetSpeed += alpha * (polarSpeed - dynamicTargetSpeed)
+        }
+        lastDynamicUpdateTime = now
+      } else {
+        dynamicTargetSpeed = polarSpeed
+        lastDynamicUpdateTime = now
+      }
+
+      const activeTargetSpeed = (settings.dynamicResponseEnabled !== false && Number.isFinite(dynamicTargetSpeed))
+        ? dynamicTargetSpeed
+        : polarSpeed
+
       if (settings.polarSpeed) {
         add('performance.polarSpeed', polarSpeed, 'm/s',
-          'Polar chart boat speed for current TWS and TWA.')
+          'Steady-state polar chart boat speed for current TWS and TWA.')
+
+        add('performance.dynamicTargetSpeed', activeTargetSpeed, 'm/s',
+          'Dynamic target boat speed accounting for vessel acceleration/deceleration lag.')
 
         // Target speed: only meaningful when sailing within the polar range
         if (Number.isFinite(targetAngle) && Number.isFinite(targetVMG)) {
@@ -450,8 +527,8 @@ module.exports = (app) => {
         }
 
         if (Number.isFinite(BSP)) {
-          add('performance.polarSpeedRatio', BSP / polarSpeed, 'ratio',
-            'Actual boat speed divided by polar speed.')
+          add('performance.polarSpeedRatio', BSP / activeTargetSpeed, 'ratio',
+            'Actual boat speed divided by active dynamic polar target speed.')
         }
       }
 
@@ -469,9 +546,12 @@ module.exports = (app) => {
         }
       }
     } else {
+      dynamicTargetSpeed = null
+      lastDynamicUpdateTime = 0
       // Clear these paths so no stale non-zero value remains on the SK bus
       if (settings.polarSpeed) {
         values.push({ path: 'performance.polarSpeed', value: null })
+        values.push({ path: 'performance.dynamicTargetSpeed', value: null })
         values.push({ path: 'performance.polarSpeedRatio', value: null })
         values.push({ path: 'performance.targetSpeed', value: null })
       }
@@ -623,19 +703,24 @@ module.exports = (app) => {
           : null
         const polarSpeed = polarResult ? polarResult.value : null
 
-        const performance = (Number.isFinite(BSP) && Number.isFinite(polarSpeed) && polarSpeed > 0)
-          ? BSP / polarSpeed
+        const activeTarget = (settings.dynamicResponseEnabled !== false && Number.isFinite(dynamicTargetSpeed))
+          ? dynamicTargetSpeed
+          : polarSpeed
+
+        const performance = (Number.isFinite(BSP) && Number.isFinite(activeTarget) && activeTarget > 0)
+          ? BSP / activeTarget
           : null
 
         const si = v => Number.isFinite(v) ? parseFloat(v.toFixed(5)) : null
 
         res.json({
-          tws:         si(TWS),
-          twa:         si(TWAsigned),
-          bsp:         si(BSP),
-          polarSpeed:  si(polarSpeed),
-          performance: Number.isFinite(performance) ? parseFloat(performance.toFixed(5)) : null,
-          polarState:  polarResult ? polarResult.state : null
+          tws:                si(TWS),
+          twa:                si(TWAsigned),
+          bsp:                si(BSP),
+          polarSpeed:         si(polarSpeed),
+          dynamicTargetSpeed: si(activeTarget),
+          performance:        Number.isFinite(performance) ? parseFloat(performance.toFixed(5)) : null,
+          polarState:         polarResult ? polarResult.state : null
         })
       })
 
@@ -700,6 +785,11 @@ module.exports = (app) => {
             }
           },
           outputs,
+          dynamicResponse: {
+            enabled: settings.dynamicResponseEnabled !== false,
+            tau: Number(settings.vesselResponseTau) || 18.0,
+            dynamicTargetSpeed: si(dynamicTargetSpeed)
+          },
           polarState,
           lifecycleWarnings
         })
@@ -715,14 +805,15 @@ module.exports = (app) => {
         const ratio = { formula: 'value * 100', symbol: '%', displayFormat: '0.1' }
 
         res.json({
-          tws:         { units: 'm/s', displayUnits: speed },
-          twa:         { units: 'rad', displayUnits: angle },
-          bsp:         { units: 'm/s', displayUnits: speed },
-          polarSpeed:  { units: 'm/s', displayUnits: speed },
-          performance: { units: 'ratio', displayUnits: ratio },
-          'curve.tbs': { units: 'm/s', displayUnits: speed },
-          'curve.vmg': { units: 'm/s', displayUnits: speed },
-          'curve.twa': { units: 'rad', displayUnits: angle },
+          tws:                { units: 'm/s', displayUnits: speed },
+          twa:                { units: 'rad', displayUnits: angle },
+          bsp:                { units: 'm/s', displayUnits: speed },
+          polarSpeed:         { units: 'm/s', displayUnits: speed },
+          dynamicTargetSpeed: { units: 'm/s', displayUnits: speed },
+          performance:        { units: 'ratio', displayUnits: ratio },
+          'curve.tbs':        { units: 'm/s', displayUnits: speed },
+          'curve.vmg':        { units: 'm/s', displayUnits: speed },
+          'curve.twa':        { units: 'rad', displayUnits: angle },
           activePolar: activePolarDoc ? {
             id: activePolarId,
             name: activePolarDoc.name || activePolarId,
@@ -796,8 +887,17 @@ module.exports = (app) => {
       }
       performanceFactorHandler.subscribe()
 
-      const SmootherClass = getSmootherClass(settings.smootherType)
-      const smootherOptions = getSmootherOptions(settings.smootherType, settings)
+      dynamicTargetSpeed = null
+      lastDynamicUpdateTime = 0
+
+      const windType = settings.windSmootherType || settings.smootherType || 'Kalman'
+      const bspType = settings.bspSmootherType || settings.smootherType || 'Kalman'
+
+      const WindSmootherClass = getSmootherClass(windType)
+      const windSmootherOptions = getSmootherOptions(windType, settings, 'wind')
+
+      const BspSmootherClass = getSmootherClass(bspType)
+      const bspSmootherOptions = getSmootherOptions(bspType, settings, 'bsp')
 
       // Wind vector smoother (TWS + TWA combined as a Cartesian vector —
       // avoids ±π wraparound discontinuity during smoothing)
@@ -808,8 +908,8 @@ module.exports = (app) => {
         subscribe: true,
         app,
         pluginId: plugin.id,
-        SmootherClass,
-        smootherOptions,
+        SmootherClass: WindSmootherClass,
+        smootherOptions: windSmootherOptions,
         ..._wireHandlerWatchdog({
           id: 'wind.smoothed',
           getPath: () => `${windSmoother?.polar?.pathMagnitude ?? 'environment.wind.speedTrue'}, ${windSmoother?.polar?.pathAngle ?? 'environment.wind.angleTrueWater'}`,
@@ -831,8 +931,8 @@ module.exports = (app) => {
         subscribe: true,
         app,
         pluginId: plugin.id,
-        SmootherClass,
-        smootherOptions,
+        SmootherClass: BspSmootherClass,
+        smootherOptions: bspSmootherOptions,
         ..._wireHandlerWatchdog({
           id: 'bsp.smoothed',
           getPath: () => bspSmoother?.handler?.path ?? (settings.useSOG ? 'navigation.speedOverGround' : 'navigation.speedThroughWater'),
@@ -847,8 +947,8 @@ module.exports = (app) => {
       if (settings.tackTrue) {
         hdgSmoother = new SmoothedAngle(app, plugin.id, 'hdg', 'navigation.headingTrue', {
           angleRange: '0to2pi',
-          SmootherClass,
-          smootherOptions,
+          SmootherClass: WindSmootherClass,
+          smootherOptions: windSmootherOptions,
           ..._wireHandlerWatchdog({
             id: 'hdg.smoothed',
             getPath: () => hdgSmoother?.handler?.path ?? 'navigation.headingTrue',
@@ -874,6 +974,8 @@ module.exports = (app) => {
       polar = null
       activePolarId = null
       activePolarDoc = null
+      dynamicTargetSpeed = null
+      lastDynamicUpdateTime = 0
       lifecycleWarningMap = new Map()
       lifecycleWarnings = []
       app.debug('Plugin stopped')

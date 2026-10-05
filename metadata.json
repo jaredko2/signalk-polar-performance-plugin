@@ -1,0 +1,7 @@
+{
+  "name": "signalk-polar-performance-plugin",
+  "description": "Calculates live sailing performance from the active polar selected in a polar management plugin.",
+  "capabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
