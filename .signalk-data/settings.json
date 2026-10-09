@@ -1,5 +1,5 @@
 {
-  "settingsVersion": 3,
+  "settingsVersion": 4,
   "showAllTwsLines": true,
   "smootherType": "Exponential",
   "smootherParamExponential": 1,
@@ -15,6 +15,10 @@
   "bspSmootherParamKalman": 0.04,
   "dynamicResponseEnabled": true,
   "vesselResponseTau": 18,
+  "waveCorrectionEnabled": false,
+  "vesselLength": 12,
+  "waveDragSensitivity": 1,
+  "waveCorrection": false,
   "beatAngle": false,
   "beatVMG": false,
   "targetTWA": false,

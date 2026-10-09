@@ -12,7 +12,7 @@ const {
   KalmanSmoother
 } = require('signalkutilities')
 
-const CURRENT_SETTINGS_VERSION = 3
+const CURRENT_SETTINGS_VERSION = 4
 
 const STALE_RESUBSCRIBE_PERIOD = 60000 // ms — idle period before live input subscriptions are re-established
 
@@ -33,6 +33,10 @@ const DEFAULT_SETTINGS = {
   bspSmootherParamKalman: 0.04,
   dynamicResponseEnabled: true,
   vesselResponseTau: 18.0,
+  waveCorrectionEnabled: false,
+  vesselLength: 12.0,
+  waveDragSensitivity: 1.0,
+  waveCorrection: false,
   beatAngle: false,
   beatVMG: false,
   targetTWA: false,
@@ -72,6 +76,28 @@ module.exports = (app) => {
   let lifecycleWarningMap = new Map()
   let lifecycleWarnings = []
 
+  // Wave data inputs from signalk-wave-estimator or N2K PGN 129285
+  const WAVE_PATHS = {
+    apparentDirection: 'environment.water.waves.apparentDirection',
+    apparentPeriod:    'environment.water.waves.apparentPeriod',
+    direction:         'environment.water.waves.direction',
+    maximumHeight:     'environment.water.waves.maximumHeight',
+    period:            'environment.water.waves.period',
+    significantHeight: 'environment.water.waves.significantHeight',
+    state:             'environment.water.waves.state'
+  }
+
+  let waveHandlers = {}
+  let waveData = {
+    apparentDirection: null,
+    apparentPeriod: null,
+    direction: null,
+    maximumHeight: null,
+    period: null,
+    significantHeight: null,
+    state: null
+  }
+
   // Last-computed output values, updated by computeAndSend on every cycle.
   // Keys match the settings keys; values are SI numbers or null.
   const lastOutputs = {}
@@ -85,6 +111,7 @@ module.exports = (app) => {
     optimumWindAngle:['performance.optimumWindAngle'],
     VMG:             ['performance.velocityMadeGood', 'performance.polarVelocityMadeGood', 'performance.polarVelocityMadeGoodRatio'],
     polarSpeed:      ['performance.polarSpeed', 'performance.dynamicTargetSpeed', 'performance.targetSpeed', 'performance.polarSpeedRatio'],
+    waveCorrection:  ['performance.polarSpeedSeaState', 'performance.wavePerformanceFactor', 'performance.waveDragPenalty'],
     maxSpeed:        ['performance.maxSpeed', 'performance.maxSpeedAngle'],
     tackTrue:        ['performance.tackTrue'],
     smoothedInputs:  ['environment.wind.angleTrueWaterDamped', 'performance.boatSpeedDamped'],
@@ -217,6 +244,16 @@ module.exports = (app) => {
       if (s.bspSmootherParamMovingAverage === undefined) s.bspSmootherParamMovingAverage = s.smootherParamMovingAverage ?? 10
       s.settingsVersion = 3
       app.debug('Settings migrated from v2 to v3')
+    }
+
+    if (s.settingsVersion < 4) {
+      // v3 → v4: sea-state wave correction and derating
+      if (s.waveCorrectionEnabled === undefined) s.waveCorrectionEnabled = false
+      if (s.vesselLength === undefined) s.vesselLength = 12.0
+      if (s.waveDragSensitivity === undefined) s.waveDragSensitivity = 1.0
+      if (s.waveCorrection === undefined) s.waveCorrection = false
+      s.settingsVersion = 4
+      app.debug('Settings migrated from v3 to v4 (wave correction support)')
     }
 
     // Persist if any migration ran, so migrations don't repeat on next start.
@@ -354,6 +391,12 @@ module.exports = (app) => {
       }
     }
 
+    // Trigger recompute if wave settings, dynamic response, or output toggles change
+    const RECOMPUTE_KEYS = ['waveCorrectionEnabled', 'vesselLength', 'waveDragSensitivity', 'waveCorrection', 'dynamicResponseEnabled', 'vesselResponseTau']
+    if (keys.some(k => RECOMPUTE_KEYS.includes(k)) && windSmoother?.ready && polar) {
+      computeAndSend()
+    }
+
     app.savePluginOptions(settings, (err) => {
       if (err) app.error('Failed to save settings: ' + err.message)
     })
@@ -379,6 +422,106 @@ module.exports = (app) => {
     app.handleMessage(plugin.id, {
       updates: [{ values: allPaths.map(path => ({ path, value: null })) }]
     })
+  }
+
+  // ---------------------------------------------------------------------------
+  // Hydrodynamic added wave resistance & sea state derating calculation
+  // Factors encounter angle, wave height (Hs), wave steepness, and vessel size.
+  // ---------------------------------------------------------------------------
+
+  function calculateWavePenalty(wave, twaSigned, hdg, s) {
+    if (!s.waveCorrectionEnabled) {
+      return {
+        enabled: false,
+        penalty: 0,
+        factor: 1.0,
+        encounterAngle: null,
+        significantHeight: Number.isFinite(wave.significantHeight) ? wave.significantHeight : null,
+        maximumHeight: Number.isFinite(wave.maximumHeight) ? wave.maximumHeight : null,
+        period: Number.isFinite(wave.apparentPeriod) ? wave.apparentPeriod : (Number.isFinite(wave.period) ? wave.period : null),
+        state: wave.state ?? null,
+        wDir: null,
+        wSteep: null
+      }
+    }
+
+    // Significant wave height in meters
+    let hs = null
+    if (Number.isFinite(wave.significantHeight) && wave.significantHeight >= 0) {
+      hs = wave.significantHeight
+    } else if (Number.isFinite(wave.maximumHeight) && wave.maximumHeight >= 0) {
+      hs = wave.maximumHeight / 1.6
+    }
+
+    // If no wave height data is available or water is glassy (hs < 0.04m), 0 penalty
+    if (!Number.isFinite(hs) || hs < 0.04) {
+      return {
+        enabled: true,
+        penalty: 0,
+        factor: 1.0,
+        encounterAngle: null,
+        significantHeight: hs,
+        maximumHeight: Number.isFinite(wave.maximumHeight) ? wave.maximumHeight : null,
+        period: Number.isFinite(wave.apparentPeriod) ? wave.apparentPeriod : (Number.isFinite(wave.period) ? wave.period : null),
+        state: wave.state ?? null,
+        wDir: 1.0,
+        wSteep: 1.0
+      }
+    }
+
+    // Wave period (seconds)
+    const period = Number.isFinite(wave.apparentPeriod) && wave.apparentPeriod > 0
+      ? wave.apparentPeriod
+      : (Number.isFinite(wave.period) && wave.period > 0
+          ? wave.period
+          : Math.max(2.5, 3.5 * Math.sqrt(hs)))
+
+    // Encounter angle relative to vessel bow in radians [0, PI]
+    let encAngle = null
+    if (Number.isFinite(wave.apparentDirection)) {
+      encAngle = Math.min(Math.PI, Math.abs(wave.apparentDirection))
+    } else if (Number.isFinite(wave.direction) && Number.isFinite(hdg)) {
+      let diff = Math.abs((wave.direction - hdg) % (2 * Math.PI))
+      if (diff > Math.PI) diff = 2 * Math.PI - diff
+      encAngle = diff
+    } else if (Number.isFinite(twaSigned)) {
+      encAngle = Math.min(Math.PI, Math.abs(twaSigned))
+    } else {
+      encAngle = 0 // conservative default: head seas
+    }
+
+    // 1. Encounter direction weight: head seas = 1.0, beam = 0.5, following = 0.0
+    const wDir = Math.max(0, Math.min(1.0, (1 + Math.cos(encAngle)) / 2))
+
+    // 2. Wave steepness weight (deep-water wavelength L = 1.56 * T^2)
+    const wavelength = 1.56 * Math.max(1.5, period) * Math.max(1.5, period)
+    const steepness = hs / Math.max(4.0, wavelength)
+    const wSteep = Math.max(0.6, Math.min(2.0, steepness / 0.025))
+
+    // 3. Vessel waterline length (meters)
+    const lwl = Math.max(6.0, Math.min(50.0, Number(s.vesselLength) || 12.0))
+    const hRel = hs / lwl
+
+    // 4. Wave drag sensitivity multiplier
+    const kSens = Math.max(0.2, Math.min(3.0, Number(s.waveDragSensitivity) || 1.0))
+
+    // Empirical added wave resistance power loss (Gerritsma & Beukelman):
+    const rawPenalty = kSens * wDir * wSteep * 1.5 * Math.pow(hRel, 1.15)
+    const penalty = Math.max(0, Math.min(0.40, rawPenalty))
+    const factor = Math.max(0.60, 1.0 - penalty)
+
+    return {
+      enabled: true,
+      penalty,
+      factor,
+      encounterAngle: encAngle,
+      significantHeight: hs,
+      maximumHeight: Number.isFinite(wave.maximumHeight) ? wave.maximumHeight : null,
+      period,
+      state: wave.state ?? null,
+      wDir,
+      wSteep
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -490,39 +633,53 @@ module.exports = (app) => {
     const { value: polarSpeed } = polar.speedAt({ tws: TWS, twa: TWA, performanceFactor })
     const now = Date.now()
 
+    // Calculate sea-state wave added resistance penalty
+    const wavePenalty = calculateWavePenalty(waveData, TWAsigned, HDG, settings)
+    const polarSpeedSeaState = (Number.isFinite(polarSpeed) && polarSpeed > 0)
+      ? polarSpeed * wavePenalty.factor
+      : null
+
     if (Number.isFinite(polarSpeed) && polarSpeed > 0) {
+      const targetCeiling = (settings.waveCorrectionEnabled && Number.isFinite(polarSpeedSeaState))
+        ? polarSpeedSeaState
+        : polarSpeed
+
       if (settings.dynamicResponseEnabled !== false) {
         if (!Number.isFinite(dynamicTargetSpeed) || lastDynamicUpdateTime === 0 || (now - lastDynamicUpdateTime) > 10000) {
-          dynamicTargetSpeed = polarSpeed
+          dynamicTargetSpeed = targetCeiling
         } else {
           const dt = Math.max(0.01, (now - lastDynamicUpdateTime) / 1000)
           const tau = Math.max(1, Number(settings.vesselResponseTau) || 18.0)
           const alpha = 1 - Math.exp(-dt / tau)
-          dynamicTargetSpeed += alpha * (polarSpeed - dynamicTargetSpeed)
+          dynamicTargetSpeed += alpha * (targetCeiling - dynamicTargetSpeed)
         }
         lastDynamicUpdateTime = now
       } else {
-        dynamicTargetSpeed = polarSpeed
+        dynamicTargetSpeed = targetCeiling
         lastDynamicUpdateTime = now
       }
 
       const activeTargetSpeed = (settings.dynamicResponseEnabled !== false && Number.isFinite(dynamicTargetSpeed))
         ? dynamicTargetSpeed
-        : polarSpeed
+        : targetCeiling
 
       if (settings.polarSpeed) {
         add('performance.polarSpeed', polarSpeed, 'm/s',
           'Steady-state polar chart boat speed for current TWS and TWA.')
 
         add('performance.dynamicTargetSpeed', activeTargetSpeed, 'm/s',
-          'Dynamic target boat speed accounting for vessel acceleration/deceleration lag.')
+          'Dynamic target boat speed accounting for vessel acceleration/deceleration lag and sea state.')
 
         // Target speed: only meaningful when sailing within the polar range
         if (Number.isFinite(targetAngle) && Number.isFinite(targetVMG)) {
           const cosTarget = Math.abs(Math.cos(targetAngle))
           if (cosTarget > 0.01) {
-            add('performance.targetSpeed', targetVMG / cosTarget, 'm/s',
-              'Boat speed needed to achieve target VMG at the optimal angle.')
+            const baseTargetSpeed = targetVMG / cosTarget
+            const effectiveTargetSpeed = (settings.waveCorrectionEnabled && Number.isFinite(wavePenalty.factor))
+              ? baseTargetSpeed * wavePenalty.factor
+              : baseTargetSpeed
+            add('performance.targetSpeed', effectiveTargetSpeed, 'm/s',
+              'Boat speed needed to achieve target VMG at the optimal angle in current sea state.')
           }
         }
 
@@ -530,6 +687,17 @@ module.exports = (app) => {
           add('performance.polarSpeedRatio', BSP / activeTargetSpeed, 'ratio',
             'Actual boat speed divided by active dynamic polar target speed.')
         }
+      }
+
+      if (settings.waveCorrection) {
+        if (Number.isFinite(polarSpeedSeaState)) {
+          add('performance.polarSpeedSeaState', polarSpeedSeaState, 'm/s',
+            'Sea-state adjusted polar boat speed accounting for wave added resistance.')
+        }
+        add('performance.wavePerformanceFactor', wavePenalty.factor, 'ratio',
+          'Sea-state derating factor (1.0 = flat water, < 1.0 = wave drag penalty).')
+        add('performance.waveDragPenalty', wavePenalty.penalty, 'ratio',
+          'Estimated boat speed loss ratio due to wave encounter.')
       }
 
       if (Number.isFinite(BSP)) {
@@ -554,6 +722,11 @@ module.exports = (app) => {
         values.push({ path: 'performance.dynamicTargetSpeed', value: null })
         values.push({ path: 'performance.polarSpeedRatio', value: null })
         values.push({ path: 'performance.targetSpeed', value: null })
+      }
+      if (settings.waveCorrection) {
+        values.push({ path: 'performance.polarSpeedSeaState', value: null })
+        values.push({ path: 'performance.wavePerformanceFactor', value: null })
+        values.push({ path: 'performance.waveDragPenalty', value: null })
       }
     }
 
@@ -697,15 +870,21 @@ module.exports = (app) => {
         const TWAsigned = wind ? wind.angle : null
         const TWA       = Number.isFinite(TWAsigned) ? Math.abs(TWAsigned) : null
         const BSP       = bspSmoother ? bspSmoother.value : null
+        const HDG       = hdgSmoother ? hdgSmoother.value : null
 
         const polarResult = (polar && Number.isFinite(TWS) && Number.isFinite(TWA))
           ? polar.speedAt({ tws: TWS, twa: TWA, performanceFactor })
           : null
         const polarSpeed = polarResult ? polarResult.value : null
 
+        const wavePenalty = calculateWavePenalty(waveData, TWAsigned, HDG, settings)
+        const polarSpeedSeaState = (Number.isFinite(polarSpeed) && polarSpeed > 0)
+          ? polarSpeed * wavePenalty.factor
+          : null
+
         const activeTarget = (settings.dynamicResponseEnabled !== false && Number.isFinite(dynamicTargetSpeed))
           ? dynamicTargetSpeed
-          : polarSpeed
+          : (settings.waveCorrectionEnabled && Number.isFinite(polarSpeedSeaState) ? polarSpeedSeaState : polarSpeed)
 
         const performance = (Number.isFinite(BSP) && Number.isFinite(activeTarget) && activeTarget > 0)
           ? BSP / activeTarget
@@ -718,9 +897,24 @@ module.exports = (app) => {
           twa:                si(TWAsigned),
           bsp:                si(BSP),
           polarSpeed:         si(polarSpeed),
+          polarSpeedSeaState: si(polarSpeedSeaState),
           dynamicTargetSpeed: si(activeTarget),
           performance:        Number.isFinite(performance) ? parseFloat(performance.toFixed(5)) : null,
-          polarState:         polarResult ? polarResult.state : null
+          polarState:         polarResult ? polarResult.state : null,
+          wave: {
+            enabled:            !!settings.waveCorrectionEnabled,
+            factor:             Number.isFinite(wavePenalty.factor) ? parseFloat(wavePenalty.factor.toFixed(4)) : 1.0,
+            penalty:            Number.isFinite(wavePenalty.penalty) ? parseFloat(wavePenalty.penalty.toFixed(4)) : 0,
+            polarSpeedSeaState: si(polarSpeedSeaState),
+            significantHeight:  Number.isFinite(waveData.significantHeight) ? si(waveData.significantHeight) : null,
+            maximumHeight:      Number.isFinite(waveData.maximumHeight) ? si(waveData.maximumHeight) : null,
+            apparentDirection:  Number.isFinite(waveData.apparentDirection) ? si(waveData.apparentDirection) : null,
+            apparentPeriod:     Number.isFinite(waveData.apparentPeriod) ? si(waveData.apparentPeriod) : null,
+            direction:          Number.isFinite(waveData.direction) ? si(waveData.direction) : null,
+            period:             Number.isFinite(waveData.period) ? si(waveData.period) : null,
+            state:              waveData.state ?? null,
+            encounterAngle:     Number.isFinite(wavePenalty.encounterAngle) ? si(wavePenalty.encounterAngle) : null
+          }
         })
       })
 
@@ -752,6 +946,8 @@ module.exports = (app) => {
           ? polar.speedAt({ tws: TWS, twa: Math.abs(TWAsigned), performanceFactor }).state
           : null
 
+        const wavePenalty = calculateWavePenalty(waveData, TWAsigned, HDG, settings)
+
         // Build outputs object: only include paths that are enabled and were
         // computed in the last cycle (present in lastOutputs).
         const outputs = {}
@@ -777,6 +973,25 @@ module.exports = (app) => {
               bsp: si(BSP),
               ...(settings.tackTrue && HDG != null ? { hdg: si(HDG) } : {})
             },
+            waves: {
+              raw: {
+                apparentDirection: si(waveData.apparentDirection),
+                apparentPeriod: si(waveData.apparentPeriod),
+                direction: si(waveData.direction),
+                maximumHeight: si(waveData.maximumHeight),
+                period: si(waveData.period),
+                significantHeight: si(waveData.significantHeight),
+                state: waveData.state ?? null
+              },
+              correction: {
+                enabled: !!settings.waveCorrectionEnabled,
+                vesselLength: Number(settings.vesselLength) || 12.0,
+                waveDragSensitivity: Number(settings.waveDragSensitivity) || 1.0,
+                penalty: wavePenalty.penalty,
+                factor: wavePenalty.factor,
+                encounterAngle: wavePenalty.encounterAngle
+              }
+            },
             paths: {
               tws: 'environment.wind.speedTrue',
               twa: 'environment.wind.angleTrueWater',
@@ -789,6 +1004,11 @@ module.exports = (app) => {
             enabled: settings.dynamicResponseEnabled !== false,
             tau: Number(settings.vesselResponseTau) || 18.0,
             dynamicTargetSpeed: si(dynamicTargetSpeed)
+          },
+          waveCorrection: {
+            enabled: !!settings.waveCorrectionEnabled,
+            penalty: wavePenalty.penalty,
+            factor: wavePenalty.factor
           },
           polarState,
           lifecycleWarnings
@@ -809,11 +1029,15 @@ module.exports = (app) => {
           twa:                { units: 'rad', displayUnits: angle },
           bsp:                { units: 'm/s', displayUnits: speed },
           polarSpeed:         { units: 'm/s', displayUnits: speed },
+          polarSpeedSeaState: { units: 'm/s', displayUnits: speed },
           dynamicTargetSpeed: { units: 'm/s', displayUnits: speed },
           performance:        { units: 'ratio', displayUnits: ratio },
           'curve.tbs':        { units: 'm/s', displayUnits: speed },
           'curve.vmg':        { units: 'm/s', displayUnits: speed },
           'curve.twa':        { units: 'rad', displayUnits: angle },
+          'performance.polarSpeedSeaState':    { units: 'm/s', displayUnits: speed },
+          'performance.wavePerformanceFactor': { units: 'ratio', displayUnits: ratio },
+          'performance.waveDragPenalty':        { units: 'ratio', displayUnits: ratio },
           activePolar: activePolarDoc ? {
             id: activePolarId,
             name: activePolarDoc.name || activePolarId,
@@ -870,10 +1094,6 @@ module.exports = (app) => {
       })
 
       // Active polar / performance factor — read-only, published by a 'polars' resource provider.
-      // These are event-driven (change only on user action), so the idle-watchdog
-      // unsubscribe/resubscribe used for sensor handlers below does not apply here: absence
-      // of deltas is the normal state, not a sign of a broken subscription, and periodically
-      // forcing a resubscribe would just be churn (and possible side effects) for no reason.
       activePolarHandler = new MessageHandler(app, plugin.id, 'activePolar')
       activePolarHandler.path = 'polars.activePolar'
       activePolarHandler.onDelta = () => handleActivePolarDelta()
@@ -886,6 +1106,35 @@ module.exports = (app) => {
         performanceFactor = Number.isFinite(value) ? value : 1
       }
       performanceFactorHandler.subscribe()
+
+      // Wave data subscriptions
+      waveData = {
+        apparentDirection: null,
+        apparentPeriod: null,
+        direction: null,
+        maximumHeight: null,
+        period: null,
+        significantHeight: null,
+        state: null
+      }
+      waveHandlers = {}
+
+      Object.entries(WAVE_PATHS).forEach(([key, skPath]) => {
+        const initial = app.getSelfPath ? app.getSelfPath(skPath) : undefined
+        if (initial && initial.value !== undefined) {
+          waveData[key] = initial.value
+        }
+        const handler = new MessageHandler(app, plugin.id, `wave_${key}`)
+        handler.path = skPath
+        handler.onDelta = () => {
+          waveData[key] = handler.value
+          if (isRunning && windSmoother?.ready && settings.waveCorrectionEnabled) {
+            computeAndSend()
+          }
+        }
+        handler.subscribe()
+        waveHandlers[key] = handler
+      })
 
       dynamicTargetSpeed = null
       lastDynamicUpdateTime = 0
@@ -942,8 +1191,6 @@ module.exports = (app) => {
       })
 
       // Optional heading handler for opposite-tack computation.
-      // Uses SmoothedAngle (vector-based) to avoid the 0/2π wraparound
-      // discontinuity that scalar smoothing would produce near north.
       if (settings.tackTrue) {
         hdgSmoother = new SmoothedAngle(app, plugin.id, 'hdg', 'navigation.headingTrue', {
           angleRange: '0to2pi',
@@ -971,6 +1218,19 @@ module.exports = (app) => {
       if (hdgSmoother)  { hdgSmoother.terminate();  hdgSmoother = null  }
       if (activePolarHandler) { activePolarHandler.unsubscribe(); activePolarHandler = null }
       if (performanceFactorHandler) { performanceFactorHandler.unsubscribe(); performanceFactorHandler = null }
+      Object.values(waveHandlers).forEach(h => {
+        try { h.unsubscribe() } catch (_) {}
+      })
+      waveHandlers = {}
+      waveData = {
+        apparentDirection: null,
+        apparentPeriod: null,
+        direction: null,
+        maximumHeight: null,
+        period: null,
+        significantHeight: null,
+        state: null
+      }
       polar = null
       activePolarId = null
       activePolarDoc = null

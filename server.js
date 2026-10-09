@@ -97,6 +97,15 @@ setSelfValue('navigation.speedThroughWater', 3.45);        // ~6.7 knots
 setSelfValue('navigation.speedOverGround', 3.45);
 setSelfValue('navigation.headingTrue', 1.570796);          // 90 degrees
 
+// Wave data paths (signalk-wave-estimator)
+setSelfValue('environment.water.waves.apparentDirection', -0.963);
+setSelfValue('environment.water.waves.apparentPeriod', 3.0);
+setSelfValue('environment.water.waves.direction', 2.743);
+setSelfValue('environment.water.waves.maximumHeight', 0.37);
+setSelfValue('environment.water.waves.period', 3.0);
+setSelfValue('environment.water.waves.significantHeight', 0.20);
+setSelfValue('environment.water.waves.state', 'Smooth');
+
 function emitDelta(pathStr, value) {
   setSelfValue(pathStr, value);
   const delta = {
@@ -241,6 +250,15 @@ setTimeout(() => {
   emitDelta('navigation.speedThroughWater', 3.45);
   emitDelta('navigation.speedOverGround', 3.45);
   emitDelta('navigation.headingTrue', 1.570796);
+
+  // Wave data deltas
+  emitDelta('environment.water.waves.apparentDirection', -0.963);
+  emitDelta('environment.water.waves.apparentPeriod', 3.0);
+  emitDelta('environment.water.waves.direction', 2.743);
+  emitDelta('environment.water.waves.maximumHeight', 0.37);
+  emitDelta('environment.water.waves.period', 3.0);
+  emitDelta('environment.water.waves.significantHeight', 0.20);
+  emitDelta('environment.water.waves.state', 'Smooth');
 }, 100);
 
 // Gentle live simulation tick (1 Hz) to animate instrument feedback
@@ -254,11 +272,20 @@ setInterval(() => {
   const bsp = parseFloat((3.45 + 0.2 * Math.sin(t * 0.1 + 0.3) + 0.05 * Math.sin(t * 0.3)).toFixed(3));
   const hdg = parseFloat(((1.57 + 0.04 * Math.sin(t * 0.05) + 2 * Math.PI) % (2 * Math.PI)).toFixed(4));
 
+  // Natural wave fluctuation
+  const waveHs = parseFloat((0.20 + 0.03 * Math.sin(t * 0.07)).toFixed(2));
+  const waveHmax = parseFloat((waveHs * 1.85).toFixed(2));
+  const waveAppDir = parseFloat((-0.963 + 0.05 * Math.sin(t * 0.04)).toFixed(3));
+
   emitDelta('environment.wind.speedTrue', tws);
   emitDelta('environment.wind.angleTrueWater', twa);
   emitDelta('navigation.speedThroughWater', bsp);
   emitDelta('navigation.speedOverGround', bsp);
   emitDelta('navigation.headingTrue', hdg);
+
+  emitDelta('environment.water.waves.significantHeight', waveHs);
+  emitDelta('environment.water.waves.maximumHeight', waveHmax);
+  emitDelta('environment.water.waves.apparentDirection', waveAppDir);
 }, 1000);
 
 const server = http.createServer(app);

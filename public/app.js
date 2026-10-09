@@ -198,6 +198,7 @@ function updateWarnings(el, items) {
 let liveData     = null  // from /live — smoothed values (tws, twa, bsp, polarSpeed, performance)
 let statusData   = null  // from /status — raw inputs + computed outputs
 let rawValues    = {}    // raw sensor values from /status, keyed by short name (tws/twa/bsp/hdg)
+let waveValues   = {}    // wave sensor values from /status and /live (signalk-wave-estimator)
 let outputValues = {}    // computed output values from /status, keyed by SK path string
 let settings     = null
 let lifecycleWarnings = []
@@ -246,6 +247,12 @@ const OUTPUT_DEFS = [
       { sk: 'performance/dynamicTargetSpeed', label: 'Dynamic target speed',     mk: 'bsp', fb: SPEED_DEFAULT },
       { sk: 'performance/targetSpeed',        label: 'Target boat speed',        mk: 'bsp', fb: SPEED_DEFAULT },
       { sk: 'performance/polarSpeedRatio',    label: 'Speed ratio',              mk: 'performance', fb: RATIO_DEFAULT },
+    ]},
+  { key: 'waveCorrection',    label: 'Sea-state wave correction',
+    paths: [
+      { sk: 'performance/polarSpeedSeaState',    label: 'Sea-state polar speed', mk: 'bsp',         fb: SPEED_DEFAULT },
+      { sk: 'performance/wavePerformanceFactor', label: 'Wave factor (multiplier)', mk: 'performance', fb: RATIO_DEFAULT },
+      { sk: 'performance/waveDragPenalty',        label: 'Wave drag penalty',       mk: 'performance', fb: RATIO_DEFAULT },
     ]},
   { key: 'maxSpeed',         label: 'Max polar speed',
     paths: [
@@ -319,6 +326,15 @@ async function refreshLive() {
       rawValues.twa = st.inputs.raw.twa
       rawValues.bsp = st.inputs.raw.bsp
       rawValues.hdg = st.inputs.raw.hdg ?? null
+      if (st.inputs.waves) {
+        waveValues = {
+          ...(st.inputs.waves.raw || {}),
+          ...(st.inputs.waves.correction || {})
+        }
+      }
+    }
+    if (d?.wave) {
+      Object.assign(waveValues, d.wave)
     }
     if (st.outputs) {
       const converted = {}
@@ -388,14 +404,38 @@ function _buildOverviewPage() {
   const polarInfoDiv = document.createElement('div'); polarInfoDiv.id = 'ov-polar-info'
   right.appendChild(polarInfoDiv)
 
-  right.appendChild(sectionHeading('Live Performance'))
+  // Live Performance header with quick Sea State Derating toggle
+  const perfHeader = document.createElement('div')
+  perfHeader.className = 'd-flex align-items-center justify-content-between border-bottom pb-1 mb-2 mt-3'
+  const perfTitle = document.createElement('h6')
+  perfTitle.className = 'text-uppercase fw-bold text-muted mb-0 small'
+  perfTitle.textContent = 'Live Performance'
+  perfHeader.appendChild(perfTitle)
+
+  const seaStateWrap = document.createElement('div')
+  seaStateWrap.className = 'd-flex align-items-center gap-2'
+  const seaStateLabel = document.createElement('span')
+  seaStateLabel.className = 'text-muted small'
+  seaStateLabel.textContent = 'Wave Derating:'
+  const seaStateToggle = createToggle(!!settings?.waveCorrectionEnabled, v => {
+    apiPut('/settings', { waveCorrectionEnabled: v }).then(s => {
+      if (s) { settings = s; switchPage('overview') }
+    })
+  })
+  seaStateWrap.appendChild(seaStateLabel)
+  seaStateWrap.appendChild(seaStateToggle)
+  perfHeader.appendChild(seaStateWrap)
+  right.appendChild(perfHeader)
+
   right.appendChild(buildTable([
     { label: 'True Wind Speed',        id: 'ov-tws'  },
     { label: 'True Wind Angle',        id: 'ov-twa'  },
     { label: 'Boat Speed',             id: 'ov-bsp'  },
-    { label: 'Steady Polar Target',    id: 'ov-pol'  },
+    { label: 'Flat Polar Target',      id: 'ov-pol'  },
+    { label: 'Sea-State Target',       id: 'ov-sea-pol', desc: 'Adjusted for added wave resistance' },
     { label: 'Dynamic Target (Active)',id: 'ov-dyn'  },
     { label: 'Performance',            id: 'ov-perf' },
+    { label: 'Sea State',              id: 'ov-sea-desc' },
   ]))
 
   // Targets and warnings — appended lazily by _tickOverview
@@ -490,8 +530,25 @@ function _tickOverview() {
   setVal('ov-twa',  fmtVal(d?.twa  != null  ? Math.abs(d.twa)  : null, 'twa', ANGLE_DEFAULT))
   setVal('ov-bsp',  fmtVal(d?.bsp,         'bsp',         SPEED_DEFAULT))
   setVal('ov-pol',  fmtVal(d?.polarSpeed,  'polarSpeed',  SPEED_DEFAULT))
+
+  const wave = d?.wave
+  const waveActive = !!settings?.waveCorrectionEnabled
+  if (waveActive && wave?.polarSpeedSeaState != null) {
+    const penStr = (wave.penalty && wave.penalty > 0.001) ? ` (-${(wave.penalty * 100).toFixed(1)}%)` : ''
+    setVal('ov-sea-pol', fmtVal(wave.polarSpeedSeaState, 'polarSpeed', SPEED_DEFAULT) + penStr)
+  } else {
+    setVal('ov-sea-pol', waveActive ? '—' : 'Off (Flat Water)')
+  }
+
   setVal('ov-dyn',  fmtVal(d?.dynamicTargetSpeed ?? d?.polarSpeed, 'polarSpeed', SPEED_DEFAULT))
   setVal('ov-perf', fmtVal(d?.performance, 'performance', RATIO_DEFAULT))
+
+  if (wave?.significantHeight != null) {
+    const penStr = (wave.penalty && wave.penalty > 0.001) ? ` · -${(wave.penalty * 100).toFixed(1)}% drag` : ''
+    setVal('ov-sea-desc', `${wave.significantHeight.toFixed(2)} m · ${wave.state || 'Active'}${penStr}`)
+  } else {
+    setVal('ov-sea-desc', wave?.state || '—')
+  }
 
   // Targets — build sub-table on first appearance, then update in-place
   const tEl = document.getElementById('ov-targets')
@@ -547,9 +604,10 @@ function _settingsTable(rows) {
 
 function _vesselPresets() {
   const group = document.createElement('div')
-  group.className = 'd-flex gap-2'
+  group.className = 'd-flex gap-2 flex-wrap'
   const presets = [
     { label: 'Sportsboat (8s)', tau: 8 },
+    { label: 'Vision 444 (12s)', tau: 12 },
     { label: 'Club Racer (18s)', tau: 18 },
     { label: 'Cruiser (32s)', tau: 32 }
   ]
@@ -561,6 +619,31 @@ function _vesselPresets() {
     btn.textContent = p.label
     btn.addEventListener('click', () => {
       apiPut('/settings', { vesselResponseTau: p.tau }).then(s => {
+        if (s) { settings = s; switchPage('inputs') }
+      })
+    })
+    group.appendChild(btn)
+  })
+  return group
+}
+
+function _vesselLengthPresets() {
+  const group = document.createElement('div')
+  group.className = 'd-flex gap-2 flex-wrap'
+  const presets = [
+    { label: 'Beneteau 36.7 (10.7m)', len: 10.7 },
+    { label: 'Vision 444 (13.5m)', len: 13.5 },
+    { label: '40ft Cruiser (12.2m)', len: 12.2 },
+    { label: '50ft Yacht (15.2m)', len: 15.2 }
+  ]
+  presets.forEach(p => {
+    const btn = document.createElement('button')
+    btn.type = 'button'
+    const isSelected = Math.abs((settings?.vesselLength ?? 12) - p.len) < 0.3
+    btn.className = isSelected ? 'btn btn-sm btn-primary' : 'btn btn-sm btn-outline-secondary'
+    btn.textContent = p.label
+    btn.addEventListener('click', () => {
+      apiPut('/settings', { vesselLength: p.len }).then(s => {
         if (s) { settings = s; switchPage('inputs') }
       })
     })
@@ -615,7 +698,7 @@ function _buildInputsPage() {
       )
     },
     {
-      label: 'Vessel Presets',
+      label: 'Vessel Presets (Response Time)',
       desc: 'Quick presets for boat mass and acceleration characteristics',
       control: _vesselPresets()
     },
@@ -626,6 +709,49 @@ function _buildInputsPage() {
     }
   ]
   wrap.appendChild(_settingsTable(dynRows))
+
+  // Sea State & Wave Compensation (signalk-wave-estimator)
+  wrap.appendChild(sectionHeading('Sea State & Wave Compensation (signalk-wave-estimator)'))
+  const waveRows = [
+    {
+      label: 'Enable Sea State Wave Correction',
+      desc: 'Derates polar speed targets based on real-time wave encounter angle, height, and steepness',
+      control: createToggle(!!settings?.waveCorrectionEnabled, v =>
+        apiPut('/settings', { waveCorrectionEnabled: v }).then(s => { if (s) { settings = s; switchPage('inputs') } })
+      )
+    },
+    {
+      label: 'Vessel Presets (Length)',
+      desc: 'Quick waterline length presets for wave-to-hull scaling ratio',
+      control: _vesselLengthPresets()
+    },
+    {
+      label: 'Vessel Waterline Length Lwl (m)',
+      desc: 'Waterline length used to compute relative wave height and pitching susceptibility',
+      control: createNumberInput('vesselLength', settings?.vesselLength ?? 12, { min: 6, max: 50, step: 0.5, default: 12 }, true)
+    },
+    {
+      label: 'Wave Drag Sensitivity',
+      desc: 'Multiplier for added wave resistance power loss (1.0 = standard Gerritsma-Beukelman)',
+      control: createNumberInput('waveDragSensitivity', settings?.waveDragSensitivity ?? 1.0, { min: 0.2, max: 3.0, step: 0.1, default: 1.0 }, true)
+    }
+  ]
+  wrap.appendChild(_settingsTable(waveRows))
+
+  // Live Wave State Table
+  wrap.appendChild(sectionHeading('Live Wave State (signalk-wave-estimator)'))
+  wrap.appendChild(buildTable([
+    { label: 'Significant Wave Height (Hs) — environment.water.waves.significantHeight', id: 'in-wave-hs' },
+    { label: 'Maximum Wave Height (Hmax) — environment.water.waves.maximumHeight',       id: 'in-wave-hmax' },
+    { label: 'Apparent Encounter Direction — environment.water.waves.apparentDirection',  id: 'in-wave-app-dir' },
+    { label: 'True Wave Direction — environment.water.waves.direction',                   id: 'in-wave-true-dir' },
+    { label: 'Apparent Encounter Period — environment.water.waves.apparentPeriod',        id: 'in-wave-app-period' },
+    { label: 'True Wave Period — environment.water.waves.period',                         id: 'in-wave-period' },
+    { label: 'Sea State Descriptor — environment.water.waves.state',                      id: 'in-wave-state' },
+    { label: 'Effective Encounter Angle (Bow)',                                           id: 'in-wave-enc-angle' },
+    { label: 'Calculated Wave Drag Penalty',                                              id: 'in-wave-penalty' },
+    { label: 'Sea-State Performance Factor',                                              id: 'in-wave-factor' }
+  ]))
 
   // Decoupled sensor smoothers
   wrap.appendChild(sectionHeading('Sensor Damping (Decoupled)'))
@@ -684,6 +810,7 @@ function _buildInputsPage() {
 
 function _tickInputs() {
   const d = liveData
+  const w = d?.wave || waveValues
 
   setVal('in-tws-raw', fmtVal(rawValues.tws, 'tws', SPEED_DEFAULT))
   setVal('in-tws-smo', fmtVal(d?.tws,        'tws', SPEED_DEFAULT))
@@ -692,6 +819,35 @@ function _tickInputs() {
   setVal('in-bsp-raw', fmtVal(rawValues.bsp, 'bsp', SPEED_DEFAULT))
   setVal('in-bsp-smo', fmtVal(d?.bsp,        'bsp', SPEED_DEFAULT))
   if (settings?.tackTrue) setVal('in-hdg-raw', fmtVal(rawValues.hdg, 'twa', ANGLE_DEFAULT))
+
+  // Wave inputs from signalk-wave-estimator
+  const hs = w?.significantHeight ?? waveValues?.significantHeight
+  const hmax = w?.maximumHeight ?? waveValues?.maximumHeight
+  const appDir = w?.apparentDirection ?? waveValues?.apparentDirection
+  const trueDir = w?.direction ?? waveValues?.direction
+  const appPer = w?.apparentPeriod ?? waveValues?.apparentPeriod
+  const period = w?.period ?? waveValues?.period
+  const state = w?.state ?? waveValues?.state
+  const encAngle = w?.encounterAngle ?? (appDir != null ? Math.abs(appDir) : null)
+  const penalty = w?.penalty ?? waveValues?.penalty ?? 0
+  const factor = w?.factor ?? waveValues?.factor ?? 1.0
+
+  setVal('in-wave-hs', hs != null ? hs.toFixed(2) + '\u00a0m' : '—')
+  setVal('in-wave-hmax', hmax != null ? hmax.toFixed(2) + '\u00a0m' : '—')
+  setVal('in-wave-app-dir', appDir != null ? (appDir * 180 / Math.PI).toFixed(1) + '°' : '—')
+  setVal('in-wave-true-dir', trueDir != null ? (trueDir * 180 / Math.PI).toFixed(0) + '°' : '—')
+  setVal('in-wave-app-period', appPer != null ? appPer.toFixed(1) + '\u00a0s' : '—')
+  setVal('in-wave-period', period != null ? period.toFixed(1) + '\u00a0s' : '—')
+  setVal('in-wave-state', state || '—')
+  setVal('in-wave-enc-angle', encAngle != null ? (encAngle * 180 / Math.PI).toFixed(1) + '°' : '—')
+
+  if (settings?.waveCorrectionEnabled) {
+    setVal('in-wave-penalty', (penalty * 100).toFixed(1) + '%')
+    setVal('in-wave-factor', (factor * 100).toFixed(1) + '%')
+  } else {
+    setVal('in-wave-penalty', 'Off (0.0%)')
+    setVal('in-wave-factor', 'Off (100.0%)')
+  }
 
   // Update boat speed raw label to show actual path
   const bspLabelEl = document.querySelector('#in-bsp-raw')?.closest('tr')?.cells?.[0]
@@ -703,6 +859,7 @@ function _tickInputs() {
   setStale('in-twa-smo', d?.twa        == null)
   setStale('in-bsp-raw', rawValues.bsp == null)
   setStale('in-bsp-smo', d?.bsp        == null)
+  setStale('in-wave-hs', hs == null)
 
   const warns = []
   lifecycleWarnings.forEach(w => {

@@ -1,6 +1,6 @@
 {
-  "summary":  "Revised implementation plan for dynamic boat acceleration and wind shift response compensation in SignalK Polar Performance Plugin.\nUnified model that anticipates vessel inertia lag during both gusts/lulls (TWS changes) and wind shifts (TWA lifts/headers to faster or slower angles), using a single configurable response time constant, decoupled input filtering, and clean Inputs tab UI controls.",
-  "updatedAt":  "2026-10-05T15:36:55.022246277Z",
+  "summary":  "Revised implementation plan explicitly detailing what is already implemented vs the specific changes: fixing targetSpeed dependency, adding speed/angle deltas, Vision 444 preset, and Zeus3S configuration steps.",
+  "updatedAt":  "2026-10-05T16:12:23.522262199Z",
   "requestFeedback":  true,
   "userFacing":  true
 }
